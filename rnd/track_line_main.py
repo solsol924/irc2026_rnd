@@ -176,6 +176,27 @@ def fit_poly2(points):
         return np.array([0.0, b, c])
 
     # 점이 3개 이상일 때는 정상적으로 2차 다항식 곡선 피팅
+    # ★ y축 간격 검사: 점들이 세로로 충분히 퍼져 있어야 2차 피팅이 의미 있음
+    # 간격이 너무 좁으면 픽셀 오차 하나로 a값이 폭발적으로 커져 직진을 급커브로 오인함
+    MIN_Y_SPAN = 60  # 점 집합 전체의 y축 범위가 이 픽셀 미만이면 1차 직선으로 강등
+    MIN_Y_GAP  = 20  # 인접한 두 점 사이 y축 간격이 이 픽셀 미만인 구간이 있으면 1차로 강등
+
+    y_span = float(ys.max() - ys.min())
+    ys_sorted = np.sort(ys)  # 오름차순 (위쪽 y 작음 → 아래쪽 y 큼)
+    min_gap   = float(np.diff(ys_sorted).min()) if len(ys_sorted) > 1 else 0.0
+
+    if y_span < MIN_Y_SPAN or min_gap < MIN_Y_GAP:
+        # y축 간격 불충분 → 1차 직선 피팅으로 강등 (a=0)
+        # 가장 위 점과 가장 아래 점을 잇는 직선으로 계산
+        idx_bot = int(np.argmax(ys))   # y값 최대 = 화면 아래쪽(가까운 점)
+        idx_top = int(np.argmin(ys))   # y값 최소 = 화면 위쪽(먼 점)
+        dy = ys[idx_top] - ys[idx_bot]
+        if abs(dy) < 1e-3:
+            return np.array([0.0, 0.0, float(xs.mean())])
+        b_val = (xs[idx_top] - xs[idx_bot]) / dy
+        c_val = xs[idx_bot] - b_val * ys[idx_bot]
+        return np.array([0.0, b_val, c_val])
+
     y_mean = ys.mean()
     y_std  = ys.std() if ys.std() > 1e-6 else 1.0
     yn     = (ys - y_mean) / y_std
@@ -236,12 +257,16 @@ COLOR = {
     Direction.STRAIGHT: (0, 220, 0),
     Direction.LEFT:     (255, 100, 0),
     Direction.RIGHT:    (0, 100, 255),
+    Direction.MICRO_LEFT: (200, 150, 0),    # ★ 새로 추가!
+    Direction.MICRO_RIGHT: (0, 150, 200),   # ★ 새로 추가!
     Direction.UNKNOWN:  (120, 120, 120),
 }
 ARROW = {
     Direction.STRAIGHT: "UP   STRAIGHT",
     Direction.LEFT:     "LEFT  LEFT-TURN",
     Direction.RIGHT:    "RIGHT RIGHT-TURN",
+    Direction.MICRO_LEFT: "uL   MICRO-LEFT",    # ★ 새로 추가!
+    Direction.MICRO_RIGHT: "uR   MICRO-RIGHT",  # ★ 새로 추가!
     Direction.UNKNOWN:  "?    UNKNOWN",
 }
 
@@ -280,7 +305,6 @@ def visualize(frame, mask, state, roi_top, roi_bottom, roi_left, roi_right, w, h
     cv2.circle(frame, (ox, bar_y), 8, color, -1)
     cv2.circle(frame, (w // 2, bar_y), 4, (255, 255, 255), -1)
 
-    # ★ 수정된 부분: 네모 박스와 글씨 크기 대폭 축소
     cv2.rectangle(frame, (8, 8), (250, 105), (20, 20, 20), -1)
     cv2.rectangle(frame, (8, 8), (250, 105), color, 2)
     font = cv2.FONT_HERSHEY_SIMPLEX
