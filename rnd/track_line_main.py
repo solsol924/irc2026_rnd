@@ -107,12 +107,48 @@ def preprocess(frame_roi: np.ndarray, cfg: dict) -> np.ndarray:
 
 
 def _is_rectangular(contour: np.ndarray, cfg: dict) -> bool:
+    # 1. 최소 면적 직사각형(Bounding Box) 계산
     rect  = cv2.minAreaRect(contour)
     w, h_ = rect[1]
+    
     if w < 1 or h_ < 1:
         return False
+        
+    # 2. 가로/세로 비율(Aspect Ratio)
     aspect = max(w, h_) / min(w, h_)
-    return cfg["min_aspect_ratio"] <= aspect <= cfg["max_aspect_ratio"]
+    if not (cfg["min_aspect_ratio"] <= aspect <= cfg["max_aspect_ratio"]):
+        return False
+
+    # 3. 채움 비율(Extent) - 사각형 바운딩 박스 대비 실제 면적
+    contour_area = cv2.contourArea(contour)
+    bounding_box_area = w * h_
+    if bounding_box_area == 0:
+        return False
+    extent = contour_area / bounding_box_area
+    if extent < 0.70: 
+        return False
+
+    # 4. ★ 강화 1: Solidity (고무줄 면적 대비 실제 면적) ★
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    if hull_area == 0:
+        return False
+    solidity = contour_area / hull_area
+    # 완벽한 사각형은 1.0. 찌그러지거나 파인 노이즈는 이 수치가 확 떨어집니다.
+    if solidity < 0.85: 
+        return False
+
+    # 5. ★ 강화 2: 꼭짓점 개수 확인 (다각형 근사) ★
+    # 윤곽선 둘레의 4% 정도 오차를 허용하여 다각형으로 단순화시킵니다.
+    epsilon = 0.04 * cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+    
+    # 진짜 마커(직사각형)라면 꼭짓점이 4개여야 합니다. (카메라 왜곡을 고려해 4~6개까지 허용)
+    num_vertices = len(approx)
+    if num_vertices < 4 or num_vertices > 6:
+        return False
+
+    return True
 
 
 def extract_centroids(mask: np.ndarray, cfg: dict,
@@ -319,8 +355,30 @@ def visualize(frame, mask, state, roi_top, roi_bottom, roi_left, roi_right, w, h
     cv2.putText(frame,
                 f"Pts: {len(state.centroids)}  Bands: {len(state.band_centroids)}",
                 (15, 95), font, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
-    return frame
 
+    # === [여기가 추가된 부분입니다!] 초록색 접선 및 각도 시각화 ===
+    if len(state.centroids) >= 3 and state.poly_coeffs is not None:
+        import math
+        top_cx, top_cy = int(state.centroids[-1][0]), int(state.centroids[-1][1])
+        
+        # 1. 중심선 (회색 선)
+        cv2.line(frame, (top_cx, top_cy), (top_cx, top_cy + 80), (180, 180, 180), 2, cv2.LINE_AA)
+        
+        # 2. 접선 (초록색 선)
+        angle_rad = math.radians(state.steering_angle)
+        
+        # ★ 핵심 수정: 선을 아래로 그릴 때는 x축 방향을 반전(-) 시켜야 실제 접선과 일치합니다!
+        end_x = int(top_cx - 80 * math.sin(angle_rad))  # <-- 여기가 +에서 -로 바뀌었습니다.
+        end_y = int(top_cy + 80 * math.cos(angle_rad)) 
+        
+        cv2.line(frame, (top_cx, top_cy), (end_x, end_y), (0, 255, 0), 3, cv2.LINE_AA)
+        
+        # 3. 각도 텍스트 표시
+        cv2.putText(frame, f"{abs(state.steering_angle):.1f} deg", 
+                    (top_cx - 40, top_cy + 110), font, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+    # ==============================================================
+
+    return frame
 
 # ═══════════════════════════════════════════════════════
 #  7. ROS2 노드
