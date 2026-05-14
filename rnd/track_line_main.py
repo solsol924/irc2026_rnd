@@ -198,34 +198,9 @@ def fit_poly2(points):
     pts = np.array(points, dtype=np.float64)
     ys, xs = pts[:, 1], pts[:, 0]
     
-    # 점이 딱 2개 남았을 때는 선배들 방식처럼 1차 직선으로 계산
-    if len(points) == 2:
-        y1, y2 = ys[0], ys[1]  
-        x1, x2 = xs[0], xs[1]
-        
-        # 분모가 0이 되는 에러 방지 (두 점이 수평일 경우)
-        if abs(y2 - y1) < 1e-3:
-            return np.array([0.0, 0.0, np.mean(xs)])
-            
-        b = (x2 - x1) / (y2 - y1)  
-        c = x1 - b * y1            
-        return np.array([0.0, b, c])
-
-    # 점이 3개 이상일 때는 정상적으로 2차 다항식 곡선 피팅
-    # ★ y축 간격 검사: 점들이 세로로 충분히 퍼져 있어야 2차 피팅이 의미 있음
-    # 간격이 너무 좁으면 픽셀 오차 하나로 a값이 폭발적으로 커져 직진을 급커브로 오인함
-    MIN_Y_SPAN = 60  # 점 집합 전체의 y축 범위가 이 픽셀 미만이면 1차 직선으로 강등
-    MIN_Y_GAP  = 20  # 인접한 두 점 사이 y축 간격이 이 픽셀 미만인 구간이 있으면 1차로 강등
-
-    y_span = float(ys.max() - ys.min())
-    ys_sorted = np.sort(ys)  # 오름차순 (위쪽 y 작음 → 아래쪽 y 큼)
-    min_gap   = float(np.diff(ys_sorted).min()) if len(ys_sorted) > 1 else 0.0
-
-    if y_span < MIN_Y_SPAN or min_gap < MIN_Y_GAP:
-        # y축 간격 불충분 → 1차 직선 피팅으로 강등 (a=0)
-        # 가장 위 점과 가장 아래 점을 잇는 직선으로 계산
-        idx_bot = int(np.argmax(ys))   # y값 최대 = 화면 아래쪽(가까운 점)
-        idx_top = int(np.argmin(ys))   # y값 최소 = 화면 위쪽(먼 점)
+    def fallback_to_straight():
+        idx_bot = int(np.argmax(ys))
+        idx_top = int(np.argmin(ys))
         dy = ys[idx_top] - ys[idx_bot]
         if abs(dy) < 1e-3:
             return np.array([0.0, 0.0, float(xs.mean())])
@@ -233,19 +208,63 @@ def fit_poly2(points):
         c_val = xs[idx_bot] - b_val * ys[idx_bot]
         return np.array([0.0, b_val, c_val])
 
+    if len(points) == 2:
+        return fallback_to_straight()
+
+    # ★ 방어 1: X좌표 순간이동 검사 (가로로 너무 멀리 뛰면 노이즈)
+    MAX_X_JUMP = 120 
+    ys_sorted_idx = np.argsort(-ys) 
+    for i in range(len(ys_sorted_idx)-1):
+        x1 = xs[ys_sorted_idx[i]]
+        x2 = xs[ys_sorted_idx[i+1]]
+        if abs(x2 - x1) > MAX_X_JUMP:
+            return fallback_to_straight()
+
+    # ★ 방어 3 (NEW!): 지그재그(방향성) 검사
+    # 밑에서 위로 올라갈 때, x의 변화 방향(부호)이 갑자기 바뀌면 안 됩니다.
+    # 즉, 계속 우회전하거나 계속 좌회전해야지, 우회전했다 좌회전하는 건 비정상입니다.
+    if len(points) >= 3:
+        x_diffs = []
+        for i in range(len(ys_sorted_idx)-1):
+            dx = xs[ys_sorted_idx[i+1]] - xs[ys_sorted_idx[i]]
+            x_diffs.append(dx)
+            
+        # 첫 번째 점과 두 번째 점의 x 변화량 부호
+        sign_1 = np.sign(x_diffs[0]) if abs(x_diffs[0]) > 5 else 0 # 5픽셀 미만 미세 변화는 무시
+        # 두 번째 점과 세 번째 점의 x 변화량 부호
+        sign_2 = np.sign(x_diffs[1]) if abs(x_diffs[1]) > 5 else 0
+        
+        # 부호가 명확히 반대일 경우 (지그재그 꺾임 발생)
+        if sign_1 * sign_2 < 0:
+            return fallback_to_straight() # 갈매기 곡선 금지! 직선으로 강등
+
+    MIN_Y_SPAN = 60  
+    MIN_Y_GAP  = 20  
+    y_span = float(ys.max() - ys.min())
+    ys_sorted = np.sort(ys)
+    min_gap   = float(np.diff(ys_sorted).min()) if len(ys_sorted) > 1 else 0.0
+
+    if y_span < MIN_Y_SPAN or min_gap < MIN_Y_GAP:
+        return fallback_to_straight()
+
     y_mean = ys.mean()
     y_std  = ys.std() if ys.std() > 1e-6 else 1.0
     yn     = (ys - y_mean) / y_std
     try:
         a_n, b_n, c_n = np.polyfit(yn, xs, 2)
     except (np.linalg.LinAlgError, ValueError):
-        return None
+        return fallback_to_straight()
         
     s = y_std
     a = a_n / s**2
     b = -2 * a_n * y_mean / s**2 + b_n / s
     c = a_n * y_mean**2 / s**2 - b_n * y_mean / s + c_n
     
+    # ★ 방어 2: 최대 곡률 제한 (비정상 급커브 방지)
+    MAX_CURVATURE = 0.006
+    if abs(a) > MAX_CURVATURE:
+        return fallback_to_straight()
+        
     return np.array([a, b, c])
 
 
@@ -266,16 +285,30 @@ def analyze_frame(frame: np.ndarray, cfg: dict) -> tuple[TrackState, np.ndarray]
     # 여기서 추출된 점들은 이미 아래쪽(가까운 쪽)부터 위쪽 순서로 정렬되어 있습니다.
     centroids_roi = extract_centroids(mask_roi, cfg, offset_x=roi_left, offset_y=roi_top)
     
-    # ★ 핵심 수정: 무조건 앞쪽(가장 가까운) 3개의 점만 잘라서 사용합니다!
-    closest_3_pts = centroids_roi[:3] 
+    # [징검다리(체인) 로직] - 연속된 점만 묶습니다!
+    continuous_pts = []
+    if centroids_roi:
+        continuous_pts.append(centroids_roi[0])
+        MAX_GAP = 160  # 점과 점 사이의 최대 허용 거리
+        
+        for pt in centroids_roi[1:]:
+            prev_pt = continuous_pts[-1]
+            dist = ((pt[0] - prev_pt[0])**2 + (pt[1] - prev_pt[1])**2)**0.5
+            
+            if dist < MAX_GAP:
+                continuous_pts.append(pt)
+            else:
+                break
     
-    # 밴드 샘플링과 피팅 모두 이 3개의 점만 가지고 진행합니다.
-    band_pts  = band_sample(closest_3_pts, roi_top, roi_bottom, cfg["n_bands"])
-    fit_src = band_pts if len(band_pts) >= cfg["min_points_for_poly"] else closest_3_pts
-    coeffs  = fit_poly2(fit_src) if len(fit_src) >= cfg["min_points_for_poly"] else None
+    # ★ 핵심 수정: 낡은 band_sample 기능을 완전히 삭제합니다!
+    # 걸러진 연속된 점(징검다리)을 5개까지 그대로 가져와서 실제 트랙의 궤적을 만듭니다.
+    target_pts = continuous_pts[:5] 
+    
+    # 2차 함수 피팅도 가짜 점이 아닌, 진짜 연속된 점(target_pts)으로만 계산합니다.
+    coeffs  = fit_poly2(target_pts) if len(target_pts) >= cfg["min_points_for_poly"] else None
 
-    # 상태 판별 시에도 3개의 점 정보만 넘겨줍니다.
-    state = determine_direction(closest_3_pts, band_pts, coeffs, w, cfg)
+    # 상태 판별 시에도 진짜 점 정보만 넘겨줍니다. (band_pts 자리에도 똑같이 target_pts 전달)
+    state = determine_direction(target_pts, target_pts, coeffs, w, cfg)
 
     full_mask = np.zeros((h, w), dtype=np.uint8)
     full_mask[roi_top:roi_bottom, roi_left:roi_right] = mask_roi
@@ -356,26 +389,62 @@ def visualize(frame, mask, state, roi_top, roi_bottom, roi_left, roi_right, w, h
                 f"Pts: {len(state.centroids)}  Bands: {len(state.band_centroids)}",
                 (15, 95), font, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
 
-    # === [여기가 추가된 부분입니다!] 초록색 접선 및 각도 시각화 ===
+    # === 초록색 접선 및 각도 시각화 ===
     if len(state.centroids) >= 3 and state.poly_coeffs is not None:
         import math
-        top_cx, top_cy = int(state.centroids[-1][0]), int(state.centroids[-1][1])
+        if state.band_centroids and len(state.band_centroids) >= 2:
+            mid = len(state.band_centroids) // 2
+            target_cx, target_cy = int(state.band_centroids[mid][0]), int(state.band_centroids[mid][1])
+        else:
+            target_cx, target_cy = int(state.centroids[1][0]), int(state.centroids[1][1])
         
-        # 1. 중심선 (회색 선)
-        cv2.line(frame, (top_cx, top_cy), (top_cx, top_cy + 80), (180, 180, 180), 2, cv2.LINE_AA)
+        # 1. 중심선 (회색 선) - 로봇의 직진 방향이므로 화면 '위쪽(-y)'으로 그립니다!
+        cv2.line(frame, (target_cx, target_cy), (target_cx, target_cy - 80), (180, 180, 180), 2, cv2.LINE_AA)
         
-        # 2. 접선 (초록색 선)
-        angle_rad = math.radians(state.steering_angle)
+        # 2. 순수 기하학적 접선 (초록색 선) 재계산
+        a, b, c = state.poly_coeffs
+        dx_dy = 2 * a * target_cy + b
+        pure_tangent_angle = math.degrees(math.atan(-dx_dy))
+        pure_angle_rad = math.radians(pure_tangent_angle)
         
-        # ★ 핵심 수정: 선을 아래로 그릴 때는 x축 방향을 반전(-) 시켜야 실제 접선과 일치합니다!
-        end_x = int(top_cx - 80 * math.sin(angle_rad))  # <-- 여기가 +에서 -로 바뀌었습니다.
-        end_y = int(top_cy + 80 * math.cos(angle_rad)) 
+        # 위쪽(-y)으로 뻗어나가며, 각도에 따라 x축으로 휘어짐
+        end_x = int(target_cx + 80 * math.sin(pure_angle_rad))
+        end_y = int(target_cy - 80 * math.cos(pure_angle_rad)) 
         
-        cv2.line(frame, (top_cx, top_cy), (end_x, end_y), (0, 255, 0), 3, cv2.LINE_AA)
+        cv2.line(frame, (target_cx, target_cy), (end_x, end_y), (0, 255, 0), 3, cv2.LINE_AA)
         
-        # 3. 각도 텍스트 표시
-        cv2.putText(frame, f"{abs(state.steering_angle):.1f} deg", 
-                    (top_cx - 40, top_cy + 110), font, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        # 3. 각도 텍스트 표시 (화면에 그어진 순수한 곡선의 각도)
+        cv2.putText(frame, f"Tan: {pure_tangent_angle:.1f} deg", 
+                    (target_cx + 20, target_cy - 10), font, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        
+        # 실제 로봇 바퀴/모터가 꺾어야 하는 최종 각도 (Offset 보정 포함)
+        cv2.putText(frame, f"Steer: {state.steering_angle:.1f} deg", 
+                    (target_cx + 20, target_cy + 15), font, 0.6, (0, 165, 255), 2, cv2.LINE_AA)
+    # ==============================================================
+    # ==============================================================
+
+# 1. 선을 완전히 잃어버려서 회전하며 탐색 중일 때 (점 0개)
+    if len(state.centroids) == 0:
+        import time
+        # 빨간색 굵은 테두리도 거슬린다면 두께(10 -> 2)를 얇게 하거나 아예 지우셔도 됩니다.
+        cv2.rectangle(frame, (0, 0), (w, h), (0, 0, 255), 2)
+        
+        # 왼쪽 상단 정보창 바로 아래에 깔끔하게 텍스트만 깜빡이게 표시
+        if int(time.time() * 5) % 2 == 0:
+            cv2.putText(frame, "SEARCHING...", (15, 125), font, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.putText(frame, "SEARCHING...", (15, 125), font, 0.7, (150, 150, 150), 2, cv2.LINE_AA)
+
+   # 2. 선을 방금 찾아서 타겟 좌표를 향해 복귀 중일 때 (Status 8)
+    elif state.status_code == 8:
+        cv2.rectangle(frame, (0, 0), (w, h), (0, 165, 255), 2)
+        cv2.putText(frame, "TARGET LOCKED", (15, 125), font, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
+        
+        if len(state.centroids) > 0:
+            # ★ 시각화 과녁도 맨 위([-1])가 아닌 발밑 점([0])에 찍히도록 수정!
+            tx, ty = int(state.centroids[0][0]), int(state.centroids[0][1])
+            cv2.circle(frame, (tx, ty), 15, (0, 165, 255), 2)
+            cv2.drawMarker(frame, (tx, ty), (0, 165, 255), cv2.MARKER_CROSS, 20, 2)
     # ==============================================================
 
     return frame
